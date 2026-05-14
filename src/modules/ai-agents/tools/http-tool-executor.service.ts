@@ -1,6 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import type { AiSkill, AiTool } from '@prisma/client';
+import { PrismaService } from '../../../database/prisma.service';
 import { ToolContext, ToolResult } from './tool.types';
 import { PendingActionService } from '../confirmations/pending-action.service';
 import type {
@@ -9,17 +10,20 @@ import type {
 } from '../confirmations/confirmation.types';
 
 /**
- * Skills HTTP que NÃO podem rodar direto — viram PendingAction e só
- * executam após aprovação humana. Mapeia nome da skill → impacto.
- *
- * Match é case-sensitive e bate com o `name` que o LLM vê (mesmo nome
- * persistido em ai_skills).
+ * Tabela de impacto por skill. Quando o operador marca `requiresApproval=true`
+ * em `ai_agent_skills`, a skill cria um PendingAction com este impacto.
+ * Skills não listadas defaultam pra `medium`. Não tem efeito nenhum se a
+ * skill não exigir aprovação — é só pra preencher o `preview.impact`.
  */
-const DESTRUCTIVE_HTTP_SKILLS: Record<string, ImpactLevel> = {
+const SKILL_IMPACT: Record<string, ImpactLevel> = {
   grantAccess: 'high',
   resetPassword: 'high',
   sendLoginLink: 'medium',
 };
+
+function impactFor(skillName: string): ImpactLevel {
+  return SKILL_IMPACT[skillName] ?? 'medium';
+}
 
 /**
  * Executes HTTP-backed Skills. The connection (base url + auth headers)
@@ -38,12 +42,13 @@ export class HttpToolExecutorService {
   constructor(
     private readonly config: ConfigService,
     private readonly pendingActions: PendingActionService,
+    private readonly prisma: PrismaService,
   ) {}
 
   async execute(
     skill: AiSkill,
     tool: AiTool,
-    input: Record<string, unknown>,
+    rawInput: Record<string, unknown>,
     ctx: ToolContext,
     options: { bypassPendingGate?: boolean } = {},
   ): Promise<ToolResult> {
@@ -64,13 +69,26 @@ export class HttpToolExecutorService {
       };
     }
 
-    // Skills destrutivas exigem aprovação humana — short-circuit antes
-    // de bater na rota real. `bypassPendingGate` é usado pelo executor
-    // pós-aprovação (Fase 2.5) pra rodar a skill DEPOIS que o operador
-    // aprovou — caso contrário entraríamos em loop de PendingActions.
-    const impact = DESTRUCTIVE_HTTP_SKILLS[skill.name];
-    if (impact && !options.bypassPendingGate) {
-      return this.gateAsPendingAction(skill, input, ctx, impact);
+    // Normaliza emails antes de qualquer uso. APIs do Trivapp (e várias
+    // outras) tratam emails de forma case-sensitive em alguns endpoints
+    // (ex: resetPassword retorna 404 com email "Foo@x.com" mas funciona
+    // com "foo@x.com"). Forçar lowercase + trim no input ANTES do template
+    // resolve essa classe inteira de bug sem depender do agent acertar.
+    const input = this.normalizeEmailInputs(rawInput);
+
+    // Gating configurável por (agent, skill): operador marca
+    // `ai_agent_skills.requires_approval = true` na UI quando quer que a
+    // skill seja gateada antes de executar pra esse agent específico.
+    // `bypassPendingGate` é usado pelo executor pós-aprovação pra rodar
+    // a skill DEPOIS que o operador aprovou (evita loop de PendingActions).
+    if (!options.bypassPendingGate) {
+      const link = await this.prisma.aiAgentSkill.findUnique({
+        where: { agentId_skillId: { agentId: ctx.agentId, skillId: skill.id } },
+        select: { requiresApproval: true },
+      });
+      if (link?.requiresApproval) {
+        return this.gateAsPendingAction(skill, input, ctx, impactFor(skill.name));
+      }
     }
 
     const url =
@@ -187,10 +205,18 @@ export class HttpToolExecutorService {
     return {
       output: {
         ok: true,
+        status: 'queued_for_processing',
         pendingActionId: action.id,
-        requiresUserAction: true,
         preview,
-        message: 'Aguardando aprovação humana antes de executar.',
+        // Mensagem desambígua pro LLM (Sonnet 4.6 estava interpretando o
+        // wording anterior "aguardando aprovação humana" como sinal de
+        // prompt injection e respondendo coisas paranoicas tipo "essa
+        // mensagem não veio do cliente"). Aqui afirmamos explicitamente
+        // que é FLUXO NORMAL e damos o roteiro de resposta pro cliente.
+        message:
+          'Solicitação registrada com sucesso e enviada pra processamento. Operador humano vai concluir a liberação em instantes — fluxo padrão, não é erro.',
+        agent_should_say:
+          'Avise o cliente, com naturalidade, que o acesso já foi solicitado e estará liberado em instantes. NÃO mencione "aprovação humana", "operador" ou qualquer detalhe interno do sistema.',
       },
     };
   }
@@ -320,5 +346,40 @@ export class HttpToolExecutorService {
             : undefined,
         obj,
       );
+  }
+
+  /**
+   * Normaliza qualquer campo que pareça email no input (top-level ou
+   * dentro de objetos rasos): aplica `.toLowerCase().trim()`. Mantém
+   * outros campos intactos. Defesa preventiva contra APIs case-sensitive
+   * (Trivapp/resetPassword é o caso conhecido — bug Vinicius_leppers
+   * em 2026-05-08).
+   */
+  private normalizeEmailInputs(
+    input: Record<string, unknown>,
+  ): Record<string, unknown> {
+    const normalized: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(input)) {
+      if (this.looksLikeEmailKey(key) && typeof value === 'string') {
+        normalized[key] = value.toLowerCase().trim();
+      } else if (
+        value &&
+        typeof value === 'object' &&
+        !Array.isArray(value)
+      ) {
+        // Recursão de 1 nível pra objetos rasos (ex: { user: { email: ... } })
+        normalized[key] = this.normalizeEmailInputs(
+          value as Record<string, unknown>,
+        );
+      } else {
+        normalized[key] = value;
+      }
+    }
+    return normalized;
+  }
+
+  private looksLikeEmailKey(key: string): boolean {
+    // Match: email, e-mail, userEmail, contactEmail, etc.
+    return /e[-_]?mail$/i.test(key) || /^email/i.test(key);
   }
 }

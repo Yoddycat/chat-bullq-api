@@ -113,6 +113,7 @@ model User {
   organizations         UserOrganization[]
   assignedConversations Conversation[]     @relation("AssignedAgent")
   sentMessages          Message[]          @relation("MessageSender")
+  revokedMessages       Message[]          @relation("MessageRevoker")
   notifications         Notification[]
   pushSubscriptions     PushSubscription[]
   sentInvitations       Invitation[]
@@ -155,6 +156,26 @@ model Organization {
   /// Threshold de confiança do IntentClassifier pra pular o orchestrator.
   /// Default 0.85. Abaixo disso cai no Augusto.
   aiClassifierThreshold Decimal? @default(0.85) @map("ai_classifier_threshold") @db.Decimal(3, 2)
+
+  /// Lista de domínios permitidos em links que a IA pode mandar pro
+  /// cliente. Quando preenchido (array com strings tipo "bravy.co",
+  /// "trivapp.com.br"), o runtime guard rejeita qualquer URL fora da
+  /// lista — IA tem que reescrever sem o link inventado. NULL ou
+  /// array vazio = permissivo (só loga warning, não bloqueia).
+  allowedUrlDomains    Json?   @map("allowed_url_domains")
+
+  // ─── Watchdog (conversas presas) ────────────────
+  /// Liga/desliga o watchdog que detecta conversas onde a IA travou ou
+  /// o humano abandonou. Default: true.
+  watchdogEnabled       Boolean @default(true) @map("watchdog_enabled")
+  /// Horário em que o watchdog atua (mesmo formato de `aiBusinessHours`:
+  /// `{monday: {enabled, windows: [["09:00","18:00"]]}, ...}`). null = 24/7.
+  /// Reusa `aiTimezone` pra resolução de fuso.
+  watchdogBusinessHours Json?   @map("watchdog_business_hours")
+  /// Parâmetros do watchdog. Shape:
+  /// `{ delayBotMin, delayPendingMin, delayHumanIdleMin, maxAttempts }`.
+  /// null = usa defaults do código (15, 15, 60, 3).
+  watchdogConfig        Json?   @map("watchdog_config")
 
   members       UserOrganization[]
   channels      Channel[]
@@ -422,6 +443,20 @@ model Conversation {
   aiDisabledAt  DateTime? @map("ai_disabled_at")
   activeAgentId String?   @map("active_agent_id")
 
+  // ─── Watchdog state ─────────────────────────────
+  /// Tentativas de reativação. Cada vez que o watchdog reaciona a IA na
+  /// conversa, +1. Resetado pra 0 quando IA/humano responde com sucesso.
+  /// Quando atinge `maxAttempts`, a conversa é marcada `isStuck=true`.
+  stuckAttempts        Int       @default(0) @map("stuck_attempts")
+  /// Última vez que o watchdog avaliou a conversa.
+  lastWatchdogCheckAt  DateTime? @map("last_watchdog_check_at")
+  /// ID do job reativo (BullMQ) atualmente agendado pra essa conversa.
+  /// Permite cancelar/substituir o job quando algo muda na conversa.
+  watchdogJobId        String?   @map("watchdog_job_id")
+  /// Bandeira "presa pra valer". Setada quando `stuckAttempts >= maxAttempts`.
+  /// Frontend filtra por isso na inbox e no dashboard.
+  isStuck              Boolean   @default(false) @map("is_stuck")
+
   organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
   channel      Channel      @relation(fields: [channelId], references: [id])
   contact      Contact      @relation(fields: [contactId], references: [id])
@@ -515,6 +550,20 @@ model Message {
   failedReason   String?            @map("failed_reason")
   metadata       Json               @default("{}")
   createdAt      DateTime           @default(now()) @map("created_at")
+
+  // ─── Revoke state (delete for everyone) ─────────
+  /// Quando setado, a mensagem foi marcada como deletada. UI renderiza
+  /// placeholder em vez do conteúdo. Não removemos a row pra preservar
+  /// auditoria + histórico (audit-log mantém o conteúdo original).
+  revokedAt              DateTime? @map("revoked_at")
+  revokedBy              String?   @map("revoked_by")
+  /// Se conseguimos propagar o delete pro provider (Zappfy/Meta).
+  /// - true  = chamada na API do provider funcionou (some no app do cliente)
+  /// - false = provider não suportou ou erro (mensagem ficou no app do cliente,
+  ///           só sumiu no nosso inbox)
+  /// - null  = ainda não foi revogada
+  revokeSucceededRemote  Boolean?  @map("revoke_succeeded_remote")
+  revoker                User?     @relation("MessageRevoker", fields: [revokedBy], references: [id], onDelete: SetNull)
 
   conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
   sender       User?        @relation("MessageSender", fields: [senderId], references: [id], onDelete: SetNull)
@@ -980,6 +1029,12 @@ model AiSkillVersion {
 model AiAgentSkill {
   agentId String @map("agent_id")
   skillId String @map("skill_id")
+
+  /// Se true, esta skill quando chamada por este agent NÃO executa direto:
+  /// cria um AiPendingAction e aguarda aprovação humana via inbox.
+  /// Default false — agent decide autonomamente se chama ou não.
+  /// Configurável por (agent, skill) na UI Jarvis → Agentes → Skills.
+  requiresApproval Boolean @default(false) @map("requires_approval")
 
   agent AiAgent @relation(fields: [agentId], references: [id], onDelete: Cascade)
   skill AiSkill @relation(fields: [skillId], references: [id], onDelete: Cascade)

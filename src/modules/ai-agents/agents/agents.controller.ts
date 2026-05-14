@@ -88,6 +88,46 @@ export class AgentsController {
     return this.service.unassignChannel(orgId, id, channelId);
   }
 
+  @Get('watchdog/stats')
+  @ApiOperation({
+    summary:
+      'Snapshot do watchdog: KPIs (timers ativos, checks 24h, reativações, presas) + listas de conversas em alerta',
+  })
+  watchdogStats(@CurrentOrg('id') orgId: string) {
+    return this.service.watchdogStats(orgId);
+  }
+
+  @Get(':id/skills')
+  @ApiOperation({
+    summary: 'List skills attached to this agent (with requiresApproval flag)',
+  })
+  listSkills(
+    @CurrentOrg('id') orgId: string,
+    @Param('id') id: string,
+  ) {
+    return this.service.listSkills(orgId, id);
+  }
+
+  @Patch(':id/skills/:skillId/approval')
+  @Roles(OrgRole.OWNER, OrgRole.ADMIN)
+  @ApiOperation({
+    summary:
+      'Toggle requiresApproval pra essa skill nesse agent. Body: { requiresApproval: boolean }',
+  })
+  setSkillApproval(
+    @CurrentOrg('id') orgId: string,
+    @Param('id') id: string,
+    @Param('skillId') skillId: string,
+    @Body() body: { requiresApproval: boolean },
+  ) {
+    return this.service.setSkillApproval(
+      orgId,
+      id,
+      skillId,
+      Boolean(body?.requiresApproval),
+    );
+  }
+
   @Get(':id/runs')
   @ApiOperation({ summary: 'List recent runs of this agent (with tool calls)' })
   runs(
@@ -110,6 +150,7 @@ export class AgentsController {
   feed(
     @CurrentOrg('id') orgId: string,
     @Query('agentId') agentId?: string,
+    @Query('conversationId') conversationId?: string,
     @Query('period') period?: string,
     @Query('status') status?: string,
     @Query('finalAction') finalAction?: string,
@@ -119,6 +160,7 @@ export class AgentsController {
   ) {
     return this.service.listOrgRuns(orgId, {
       agentId,
+      conversationId,
       period: this.parsePeriodAll(period),
       status: this.parseRunStatus(status),
       finalAction,
